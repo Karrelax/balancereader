@@ -173,14 +173,19 @@ class MainActivity : AppCompatActivity() {
                 startBleScan()
             }
         } else {
-            if (!bluetoothAdapter?.isEnabled == true) {
-                enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            if (bluetoothAdapter?.isEnabled != true) {
+            enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             } else {
                 startBleScan()
             }
         }
     }
-    
+    private fun updateDeviceList() {
+    // Example: refresh UI list, adapter, etc.
+    // Replace this with your real adapter logic
+
+    println("Devices found: ${scanResults.size}")
+}
     private fun startBleScan() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
@@ -450,7 +455,9 @@ class MainActivity : AppCompatActivity() {
         }
         return file
     }
-    
+    private fun updateDeviceList() {
+    // TODO: implement your device refresh logic here
+    }
     override fun onDestroy() {
         super.onDestroy()
         LocalBroadcastManager.getInstance(this).unregisterReceiver(bleReceiver)
