@@ -14,13 +14,16 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '8'
+          java-version: '17'
 
-      - name: Install Gradle & create wrapper
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Upgrade Gradle Wrapper
         run: |
           sudo apt update
           sudo apt install gradle -y
-          gradle wrapper
+          gradle wrapper --gradle-version 7.5
 
       - name: Build APK
         run: |
