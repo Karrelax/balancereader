@@ -455,9 +455,7 @@ class MainActivity : AppCompatActivity() {
         }
         return file
     }
-    private fun updateDeviceList() {
-    // TODO: implement your device refresh logic here
-    }
+
     override fun onDestroy() {
         super.onDestroy()
         LocalBroadcastManager.getInstance(this).unregisterReceiver(bleReceiver)
