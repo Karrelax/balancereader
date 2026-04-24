@@ -1,12 +1,13 @@
 package com.bodyscalereader.app
 
 object BodyCompositionCalculator {
-    
-    // Configuración del usuario (se puede hacer ajustable en Settings)
-    private const val ALTURA = 1.62f  // metros
-    private const val EDAD = 44       // años
-    private const val SEXO = "FEMENINO"  // "MASCULINO" o "FEMENINO"
-    
+
+    data class UserProfile(
+        val heightM: Float,
+        val age: Int,
+        val sex: String  // "MASCULINO" or "FEMENINO"
+    )
+
     data class Result(
         val bmi: Float,
         val bodyWater: Float,
@@ -24,27 +25,27 @@ object BodyCompositionCalculator {
         val muscleRatio: Float,
         val bodyType: String
     )
-    
-    fun calculate(weight: Float, impedance: Float, heartRate: Int): Result {
-        val bmi = weight / (ALTURA * ALTURA)
-        
-        // Fórmulas basadas en el análisis de tus datos
-        val bodyFat = calculateBodyFat(weight, impedance)
+
+    fun calculate(weight: Float, impedance: Float, heartRate: Int, profile: UserProfile): Result {
+        val bmi = weight / (profile.heightM * profile.heightM)
+
+        val bodyFat = calculateBodyFat(weight, impedance, profile)
         val leanMass = weight * (1 - bodyFat / 100)
         val muscleMass = leanMass * 0.93f
-        val bodyWater = calculateBodyWater(weight, impedance)
-        val visceralFat = 0.5f * bodyFat + 0.1f * EDAD - 1.95f
+        val bodyWater = calculateBodyWater(weight, impedance, profile)
+        val visceralFat = (0.5f * bodyFat + 0.1f * profile.age - 1.95f).coerceAtLeast(0f)
         val boneMass = leanMass * 0.048f
-        val bmr = calculateBMR(weight, leanMass)
+        val bmr = calculateBMR(weight, profile)
         val protein = (muscleMass * 0.22f / weight) * 100
-        val subcutaneousFat = bodyFat - visceralFat * 0.46f
-        val standardWeight = 21.75f * (ALTURA * ALTURA)
+        val subcutaneousFat = (bodyFat - visceralFat * 0.46f).coerceAtLeast(0f)
+        val standardWeight = 21.75f * (profile.heightM * profile.heightM)
         val skeletalMuscle = (muscleMass * 0.55f / weight) * 100
-        val idealMuscleMass = if (SEXO == "FEMENINO") 0.4f * ALTURA * 100 else 0.45f * ALTURA * 100
+        val idealMuscleMass = if (profile.sex == "FEMENINO") 0.4f * profile.heightM * 100
+                              else 0.45f * profile.heightM * 100
         val muscleRatio = (muscleMass / idealMuscleMass) * 100
-        val physicalAge = calculatePhysicalAge(bmr)
+        val physicalAge = calculatePhysicalAge(bmr, profile.age)
         val bodyType = determineBodyType(bodyFat, muscleMass)
-        
+
         return Result(
             bmi = bmi,
             bodyWater = bodyWater,
@@ -63,39 +64,52 @@ object BodyCompositionCalculator {
             bodyType = bodyType
         )
     }
-    
-    private fun calculateBodyFat(weight: Float, impedance: Float): Float {
-        // Fórmula empírica ajustada a tus datos
-        // Con weight=65.35, impedance=215.84 → 13.9%
-        // Modelo lineal simple: Fat% = a*weight + b*impedance + c
-        // Resolviendo con un punto: 13.9 = a*65.35 + b*215.84 + c
-        // Asumiendo a=0, b=0.0644, c=0:
-        // 0.0644 * 215.84 = 13.9 ✅
-        return 0.0644f * impedance
+
+    // FIX: body fat now uses BOTH weight and impedance, plus sex-specific offsets
+    // Deurenberg formula adapted for bioelectrical impedance
+    private fun calculateBodyFat(weight: Float, impedance: Float, profile: UserProfile): Float {
+        val heightCm = profile.heightM * 100
+        // Resistance index = height² / impedance
+        val ri = (heightCm * heightCm) / impedance
+        return if (profile.sex == "FEMENINO") {
+            (0.756f * (weight / ri) + 0.110f * weight - 0.058f * profile.age - 1.6f)
+                .coerceIn(3f, 60f)
+        } else {
+            (0.756f * (weight / ri) + 0.110f * weight - 0.058f * profile.age - 10.8f)
+                .coerceIn(3f, 60f)
+        }
     }
-    
-    private fun calculateBodyWater(weight: Float, impedance: Float): Float {
-        // Con impedance=215.84 → 57.7%
-        // Water% = 0.2675 * impedance
-        // 0.2675 * 215.84 = 57.74 ✅
-        return 0.2675f * impedance
+
+    // FIX: body water uses height and sex, not just impedance
+    private fun calculateBodyWater(weight: Float, impedance: Float, profile: UserProfile): Float {
+        val heightCm = profile.heightM * 100
+        // Watson formula adapted for BIA
+        return if (profile.sex == "FEMENINO") {
+            ((0.495f * heightCm * heightCm / impedance) + 1.845f)
+                .coerceIn(30f, 80f)
+        } else {
+            ((0.396f * heightCm * heightCm / impedance) + 3.791f)
+                .coerceIn(30f, 80f)
+        }
     }
-    
-    private fun calculateBMR(weight: Float, leanMass: Float): Int {
-        // Fórmula personalizada que da 1393 con weight=65.35, leanMass=56.3
-        // BMR = 9.2*weight + 5.8*altura(cm) - 4.6*edad + 180
-        return (9.2f * weight + 5.8f * ALTURA * 100 - 4.6f * EDAD + 180).toInt()
+
+    // FIX: BMR uses profile data, not hardcoded constants
+    // Mifflin-St Jeor equation
+    private fun calculateBMR(weight: Float, profile: UserProfile): Int {
+        val heightCm = profile.heightM * 100
+        return if (profile.sex == "FEMENINO") {
+            (10 * weight + 6.25f * heightCm - 5 * profile.age - 161).toInt()
+        } else {
+            (10 * weight + 6.25f * heightCm - 5 * profile.age + 5).toInt()
+        }
     }
-    
-    private fun calculatePhysicalAge(bmr: Int): Int {
-        // Tabla simplificada: si BMR es 1393, edad física = 44
-        // Relación inversa aproximada
+
+    private fun calculatePhysicalAge(bmr: Int, chronologicalAge: Int): Int {
         val baseBMR = 1600
-        val baseAge = 30
         val diff = baseBMR - bmr
-        return (baseAge + diff / 15).coerceIn(20, 80)
+        return (chronologicalAge + diff / 15).coerceIn(20, 80)
     }
-    
+
     private fun determineBodyType(bodyFat: Float, muscleMass: Float): String {
         return when {
             bodyFat < 18 && muscleMass > 55 -> "Muscular"
@@ -104,7 +118,7 @@ object BodyCompositionCalculator {
             else -> "Estándar"
         }
     }
-    
+
     fun formatStats(result: Result): String {
         return """
             |📊 ESTADÍSTICAS CORPORALES
