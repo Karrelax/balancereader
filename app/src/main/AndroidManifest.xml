@@ -2,26 +2,38 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Bluetooth permissions -->
+    <!-- ========== PERMISOS DE BLUETOOTH ========== -->
+    <!-- Permisos básicos para Bluetooth clásico -->
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+
+    <!-- Permisos para BLE (Bluetooth Low Energy) en Android 12+ -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation"
         tools:targetApi="s" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
-    <!-- FIX: ACCESS_FINE_LOCATION is required for BLE scanning on ALL Android versions -->
+    <!--
+        ACCESS_FINE_LOCATION es REQUIRIDO para escaneo BLE en TODAS las versiones de Android.
+        En Android 12+, se usa solo para compatibilidad con versiones anteriores.
+        En Android 10-11, es obligatorio para escaneo BLE.
+    -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
-    <!-- Storage: only needed on Android < 10 -->
+    <!-- ========== PERMISOS DE ALMACENAMIENTO ========== -->
+    <!-- Solo necesario para Android 9 (API 28) o inferior -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
+    <!-- ========== CARACTERÍSTICAS REQUERIDAS ========== -->
+    <!-- Asegura que el dispositivo tenga soporte para BLE -->
     <uses-feature
         android:name="android.hardware.bluetooth_le"
         android:required="true" />
 
+    <!-- ========== APLICACIÓN ========== -->
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -33,6 +45,7 @@
         android:theme="@style/Theme.BodyScaleReader"
         tools:targetApi="31">
 
+        <!-- Actividad principal -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -42,18 +55,19 @@
             </intent-filter>
         </activity>
 
-        <!-- NEW: Settings screen -->
+        <!-- Actividad de configuración -->
         <activity
             android:name=".SettingsActivity"
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 
+        <!-- Servicio de Bluetooth LE -->
         <service
             android:name=".BluetoothLeService"
             android:enabled="true"
             android:exported="false" />
 
-        <!-- FIX: FileProvider for share-based export (replaces path toasting) -->
+        <!-- Proveedor de archivos para compartir datos (exportación) -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.provider"
