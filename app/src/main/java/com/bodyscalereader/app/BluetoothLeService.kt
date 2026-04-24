@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
 import android.content.Intent
 import android.os.Binder
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -33,11 +34,18 @@ class BluetoothLeService : Service() {
 
         val SERVICE_UUID: UUID = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
         val CHARACTERISTIC_UUID: UUID = UUID.fromString("0000fff4-0000-1000-8000-00805f9b34fb")
+        val WRITE_CHARACTERISTIC_UUID: UUID = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
         val CLIENT_CHARACTERISTIC_CONFIG: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-        const val ACTION_GATT_CONNECTED = "ACTION_GATT_CONNECTED"
+        // Activation code sent to fff1 to wake the scale up.
+        // FD-00 is the standard INSMART/Feelfit activation handshake.
+        // If the scale doesn't respond, try: FD-AA, or FE-<user bytes>
+        val ACTIVATION_CODE: ByteArray = byteArrayOf(0xFD.toByte(), 0x00.toByte())
+
+        const val ACTION_GATT_CONNECTED    = "ACTION_GATT_CONNECTED"
         const val ACTION_GATT_DISCONNECTED = "ACTION_GATT_DISCONNECTED"
-        const val ACTION_DATA_AVAILABLE = "ACTION_DATA_AVAILABLE"
+        const val ACTION_DATA_AVAILABLE    = "ACTION_DATA_AVAILABLE"
+        const val ACTION_ACTIVATION_SENT   = "ACTION_ACTIVATION_SENT"
         const val EXTRA_FRAME = "EXTRA_FRAME"
     }
 
@@ -47,11 +55,9 @@ class BluetoothLeService : Service() {
 
     override fun onBind(intent: Intent): IBinder = binder
 
-    // FIX: close existing GATT before opening a new one; support optional autoconnect
     fun connect(address: String, autoConnect: Boolean = false): Boolean {
         val device = BluetoothAdapter.getDefaultAdapter()?.getRemoteDevice(address) ?: return false
 
-        // FIX: always close old connection cleanly before reconnecting
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
@@ -64,11 +70,10 @@ class BluetoothLeService : Service() {
     }
 
     fun disconnect() {
-        autoConnectEnabled = false   // stop auto-reconnect when user explicitly disconnects
+        autoConnectEnabled = false
         autoConnectAddress = null
         handler.removeCallbacksAndMessages(null)
 
-        // FIX: both disconnect() AND close() are required to free GATT resources
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
@@ -83,6 +88,43 @@ class BluetoothLeService : Service() {
         }, reconnectDelayMs)
     }
 
+    /**
+     * Sends the activation code to the scale's write characteristic (fff1).
+     * Called automatically once notifications are enabled (onDescriptorWrite).
+     * The scale responds with F1-00 / F2-00 / F2-01 and then starts streaming data.
+     */
+    private fun sendActivationCode(gatt: BluetoothGatt) {
+        val service = gatt.getService(SERVICE_UUID)
+        val writeChar = service?.getCharacteristic(WRITE_CHARACTERISTIC_UUID)
+
+        if (writeChar == null) {
+            Log.w(TAG, "Write characteristic fff1 not found — cannot send activation code")
+            return
+        }
+
+        val sent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Android 13+: modern non-deprecated API
+            gatt.writeCharacteristic(
+                writeChar,
+                ACTIVATION_CODE,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            ) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            writeChar.value = ACTIVATION_CODE
+            writeChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            @Suppress("DEPRECATION")
+            gatt.writeCharacteristic(writeChar)
+        }
+
+        if (sent) {
+            Log.i(TAG, "Activation code sent: ${ACTIVATION_CODE.joinToString("-") { "%02X".format(it) }}")
+            broadcastUpdate(ACTION_ACTIVATION_SENT)
+        } else {
+            Log.w(TAG, "Failed to send activation code")
+        }
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
@@ -95,7 +137,6 @@ class BluetoothLeService : Service() {
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.i(TAG, "Disconnected (status=$status)")
                     broadcastUpdate(ACTION_GATT_DISCONNECTED)
-                    // FIX: close GATT resources on disconnection
                     gatt.close()
                     if (bluetoothGatt == gatt) bluetoothGatt = null
                     scheduleReconnect()
@@ -106,16 +147,36 @@ class BluetoothLeService : Service() {
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 val service = gatt.getService(SERVICE_UUID)
-                val characteristic = service?.getCharacteristic(CHARACTERISTIC_UUID)
+                val notifyChar = service?.getCharacteristic(CHARACTERISTIC_UUID)
 
-                characteristic?.let { char ->
+                notifyChar?.let { char ->
                     gatt.setCharacteristicNotification(char, true)
                     val descriptor = char.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG)
                     descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     gatt.writeDescriptor(descriptor)
-                } ?: Log.w(TAG, "Target characteristic not found on device")
+                    // Activation code is sent in onDescriptorWrite once notifications are confirmed ready
+                } ?: Log.w(TAG, "Notify characteristic fff4 not found")
             } else {
                 Log.w(TAG, "Service discovery failed: $status")
+            }
+        }
+
+        /**
+         * Called when the CCCD descriptor write completes (notifications enabled).
+         * This is the right moment to send the activation code — the scale is
+         * connected, services are discovered, and it is now listening for our write.
+         */
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.i(TAG, "Notifications enabled — sending activation code")
+                // 200ms delay lets the scale settle before the write
+                handler.postDelayed({ sendActivationCode(gatt) }, 200)
+            } else {
+                Log.w(TAG, "Descriptor write failed: $status")
             }
         }
 
