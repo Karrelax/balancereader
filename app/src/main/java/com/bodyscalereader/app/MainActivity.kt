@@ -39,17 +39,47 @@ class MainActivity : AppCompatActivity() {
     private lateinit var db: AppDatabase
     private lateinit var adapter: MeasurementAdapter
     private var bluetoothLeService: BluetoothLeService? = null
-    private var isScanning = false
     private val handler = Handler(Looper.getMainLooper())
 
+    // Datos temporales para procesar frames
     private var currentWeight: Float? = null
     private var currentImpedance: Float? = null
     private var currentHr: Int? = null
 
+    private var currentDevice: BluetoothDevice? = null
+
+    // --- Permisos y Bluetooth ---
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (getSystemService(Context.BLUETOOTH_SERVICE) as android.bluetooth.BluetoothManager).adapter
     }
 
+    // Lanzador para solicitar permisos
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        if (permissions.values.all { it }) {
+            startBluetoothService() // Inicia el servicio BLE si los permisos están concedidos
+        } else {
+            Toast.makeText(
+                this,
+                "Permisos necesarios para usar Bluetooth",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    // Lanzador para activar Bluetooth
+    private val enableBtLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            startBluetoothService()
+        } else {
+            Toast.makeText(this, "Bluetooth es necesario", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // --- Receptor de Broadcasts (BLE) ---
     private val bleReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
@@ -66,74 +96,106 @@ class MainActivity : AppCompatActivity() {
                 BluetoothLeService.ACTION_GATT_DISCONNECTED -> {
                     runOnUiThread {
                         val autoConnect = SettingsActivity.isAutoConnectEnabled(this@MainActivity)
-                        binding.btnConnect.text = "Conectar"
-                        binding.tvStatus.text = if (autoConnect) "Desconectado - Reconectando..." else "Desconectado"
-                        isScanning = false
+                        binding.btnConnect.text = if (autoConnect) "Reconectando..." else "Conectar"
+                        binding.tvStatus.text = if (autoConnect) {
+                            "Desconectado - Reconectando..."
+                        } else {
+                            "Desconectado"
+                        }
+                    }
+                }
+                BluetoothLeService.ACTION_ACTIVATION_SENT -> {
+                    runOnUiThread {
+                        binding.tvStatus.text = "Código de activación enviado - Esperando datos..."
                     }
                 }
             }
         }
     }
 
-    private val scanResults = mutableListOf<BluetoothDevice>()
+    // --- Conexión al servicio BLE ---
+    private val serviceConnection = object : android.content.ServiceConnection {
+        override fun onServiceConnected(name: android.content.ComponentName?, service: android.os.IBinder?) {
+            val binder = service as BluetoothLeService.LocalBinder
+            bluetoothLeService = binder.getService()
 
-    private val scanCallback = object : android.bluetooth.le.ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: android.bluetooth.le.ScanResult) {
-            val device = result.device
-            if (device.name?.contains("INSMART") == true && !scanResults.contains(device)) {
-                scanResults.add(device)
-                runOnUiThread { updateDeviceList() }
+            // Si hay un dispositivo guardado, conéctate automáticamente
+            val savedAddress = SettingsActivity.getSavedDeviceAddress(this@MainActivity)
+            if (savedAddress != null) {
+                val device = bluetoothAdapter?.getRemoteDevice(savedAddress)
+                device?.let {
+                    currentDevice = it
+                    val autoConnect = SettingsActivity.isAutoConnectEnabled(this@MainActivity)
+                    bluetoothLeService?.connect(it.address, autoConnect)
+                }
             }
         }
 
-        override fun onScanFailed(errorCode: Int) {
+        override fun onServiceDisconnected(name: android.content.ComponentName?) {
+            bluetoothLeService = null
             runOnUiThread {
-                Toast.makeText(this@MainActivity, "Error de escaneo: $errorCode", Toast.LENGTH_SHORT).show()
+                binding.btnConnect.text = "Conectar"
+                binding.tvStatus.text = "Servicio BLE desconectado"
             }
         }
     }
 
-    private val enableBtLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        if (result.resultCode == RESULT_OK) startBleScan()
-        else Toast.makeText(this, "Bluetooth necesario", Toast.LENGTH_SHORT).show()
-    }
-
-    private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
-        if (permissions.values.all { it }) startBleScan()
-        else Toast.makeText(this, "Permisos necesarios para escanear", Toast.LENGTH_SHORT).show()
-    }
-
+    // --- Ciclo de vida ---
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        // Inicializa la base de datos y el adaptador
         db = AppDatabase.getInstance(this)
         adapter = MeasurementAdapter { measurement -> showMeasurementDetail(measurement) }
-
         binding.rvMeasurements.layoutManager = LinearLayoutManager(this)
         binding.rvMeasurements.adapter = adapter
 
+        // Configura los botones
         setupButtons()
         loadMeasurements()
 
+        // Registra el receptor de broadcasts
         LocalBroadcastManager.getInstance(this).apply {
             registerReceiver(bleReceiver, IntentFilter(BluetoothLeService.ACTION_DATA_AVAILABLE))
             registerReceiver(bleReceiver, IntentFilter(BluetoothLeService.ACTION_GATT_CONNECTED))
             registerReceiver(bleReceiver, IntentFilter(BluetoothLeService.ACTION_GATT_DISCONNECTED))
+            registerReceiver(bleReceiver, IntentFilter(BluetoothLeService.ACTION_ACTIVATION_SENT))
         }
 
-        // Autoconnect on launch if a saved device exists and user opted in
-        tryAutoConnect()
+        // Solicita permisos y activa Bluetooth al iniciar
+        checkPermissionsAndStart()
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(bleReceiver)
+        // NO desconectes el servicio si autoconnect está activado
+        if (!SettingsActivity.isAutoConnectEnabled(this)) {
+            bluetoothLeService?.disconnect()
+        }
+        unbindService(serviceConnection)
+    }
+
+    // --- Configuración de botones ---
     private fun setupButtons() {
+        // Botón de conectar/desconectar (ahora solo desconecta manualmente)
         binding.btnConnect.setOnClickListener {
-            if (isScanning) stopBleScan() else checkPermissionsAndStart()
+            if (bluetoothLeService != null) {
+                bluetoothLeService?.disconnect()
+                SettingsActivity.setAutoConnectEnabled(this, false)
+                binding.btnConnect.text = "Conectar"
+                binding.tvStatus.text = "Desconectado"
+            } else {
+                checkPermissionsAndStart()
+            }
         }
 
+        // Botón de exportar
         binding.btnExport.setOnClickListener { showExportDialog() }
 
+        // Botón de borrar
         binding.btnClear.setOnClickListener {
             AlertDialog.Builder(this)
                 .setTitle("Borrar todo")
@@ -142,144 +204,58 @@ class MainActivity : AppCompatActivity() {
                     lifecycleScope.launch {
                         db.measurementDao().deleteAll()
                         loadMeasurements()
-                        runOnUiThread { Toast.makeText(this@MainActivity, "Borrado", Toast.LENGTH_SHORT).show() }
+                        runOnUiThread {
+                            Toast.makeText(this@MainActivity, "Borrado", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
                 .setNegativeButton("Cancelar", null)
                 .show()
         }
 
+        // Botón de configuración
         binding.btnSettings.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
     }
 
-    // FIX: permissions now correctly handle both Android 12+ and older versions
+    // --- Permisos y Bluetooth ---
     private fun checkPermissionsAndStart() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val needed = listOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ).filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        val permissions = mutableListOf<String>()
 
-            if (needed.isNotEmpty()) permissionLauncher.launch(needed.toTypedArray())
-            else startBleScan()
+        // Permisos para Android 12+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        }
+
+        // Permiso para Android < 12 (ACCESS_FINE_LOCATION es necesario para BLE)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+
+        if (permissions.isNotEmpty()) {
+            permissionLauncher.launch(permissions.toTypedArray())
         } else {
-            // FIX: pre-Android-12 requires ACCESS_FINE_LOCATION for BLE scan
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-                != PackageManager.PERMISSION_GRANTED) {
-                permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
-                return
-            }
-            if (bluetoothAdapter?.isEnabled != true) {
-                enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            // Verifica si Bluetooth está activado
+            if (bluetoothAdapter?.isEnabled == true) {
+                startBluetoothService()
             } else {
-                startBleScan()
+                enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             }
         }
     }
 
-    // FIX: actually refreshes the UI — previously just called println()
-    private fun updateDeviceList() {
-        binding.tvStatus.text = "Encontrada(s) ${scanResults.size} báscula(s)..."
-    }
-
-    private fun startBleScan() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) return
-        }
-
-        scanResults.clear()
-        isScanning = true
-        binding.btnConnect.text = "Buscando..."
-        binding.tvStatus.text = "Buscando báscula..."
-
-        bluetoothAdapter?.bluetoothLeScanner?.startScan(scanCallback)
-
-        handler.postDelayed({
-            if (isScanning) stopBleScan()
-        }, 10_000)
-    }
-
-    private fun stopBleScan() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) return
-        }
-
-        isScanning = false
-        binding.btnConnect.text = "Conectar"
-        bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
-
-        if (scanResults.isEmpty()) binding.tvStatus.text = "No se encontró báscula"
-        else showDeviceSelectionDialog()
-    }
-
-    private fun showDeviceSelectionDialog() {
-        val deviceNames = scanResults.map { "${it.name ?: "Desconocido"} (${it.address})" }.toTypedArray()
-
-        AlertDialog.Builder(this)
-            .setTitle("Selecciona tu báscula")
-            .setItems(deviceNames) { _, which ->
-                val device = scanResults[which]
-                // Save for future autoconnect
-                SettingsActivity.saveDeviceAddress(this, device.address)
-                connectToDevice(device)
-            }
-            .setNegativeButton("Cancelar", null)
-            .show()
-    }
-
-    private fun connectToDevice(device: BluetoothDevice) {
-        binding.tvStatus.text = "Conectando a ${device.name}..."
-        currentDevice = device
-
+    private fun startBluetoothService() {
         val gattIntent = Intent(this, BluetoothLeService::class.java)
         bindService(gattIntent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
-    private var currentDevice: BluetoothDevice? = null
-
-    private val serviceConnection = object : android.content.ServiceConnection {
-        override fun onServiceConnected(name: android.content.ComponentName?, service: android.os.IBinder?) {
-            val binder = service as BluetoothLeService.LocalBinder
-            bluetoothLeService = binder.getService()
-
-            currentDevice?.let { device ->
-                val autoConnect = SettingsActivity.isAutoConnectEnabled(this@MainActivity)
-                if (bluetoothLeService?.connect(device.address, autoConnect) == true) {
-                    currentWeight = null
-                    currentImpedance = null
-                    currentHr = null
-                } else {
-                    binding.tvStatus.text = "Error de conexión"
-                }
-            }
-        }
-
-        override fun onServiceDisconnected(name: android.content.ComponentName?) {
-            bluetoothLeService = null
-            binding.btnConnect.text = "Conectar"
-            binding.tvStatus.text = "Desconectado"
-        }
-    }
-
-    // Autoconnect: skip scan if we already know the device address
-    private fun tryAutoConnect() {
-        if (!SettingsActivity.isAutoConnectEnabled(this)) return
-        val address = SettingsActivity.getSavedDeviceAddress(this) ?: return
-
-        val device = runCatching {
-            bluetoothAdapter?.getRemoteDevice(address)
-        }.getOrNull() ?: return
-
-        currentDevice = device
-        binding.tvStatus.text = "Reconectando a ${device.name ?: address}..."
-
-        val gattIntent = Intent(this, BluetoothLeService::class.java)
-        bindService(gattIntent, serviceConnection, Context.BIND_AUTO_CREATE)
-    }
-
+    // --- Procesamiento de datos ---
     private fun processFrame(frame: String) {
         runOnUiThread { binding.tvStatus.text = "Recibido: $frame" }
 
@@ -289,6 +265,7 @@ class MainActivity : AppCompatActivity() {
         result.impedance?.let { currentImpedance = it }
         result.heartRate?.let { currentHr = it }
 
+        // Si tenemos todos los datos, guarda la medición
         if (currentWeight != null && currentImpedance != null && currentHr != null) {
             saveMeasurement(currentWeight!!, currentImpedance!!, currentHr!!)
             currentWeight = null
@@ -298,7 +275,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveMeasurement(weight: Float, impedance: Float, hr: Int) {
-        // FIX: user profile comes from Settings, not hardcoded constants
         val profile = SettingsActivity.getUserProfile(this)
         val stats = BodyCompositionCalculator.calculate(weight, impedance, hr, profile)
 
@@ -343,35 +319,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showMeasurementDetail(measurement: Measurement) {
-        val stats = BodyCompositionCalculator.Result(
-            bmi = measurement.bmi,
-            bodyWater = measurement.bodyWater,
-            bodyFat = measurement.bodyFat,
-            muscleMass = measurement.muscleMass,
-            visceralFat = measurement.visceralFat,
-            boneMass = measurement.boneMass,
-            bmr = measurement.bmr,
-            protein = measurement.protein,
-            subcutaneousFat = measurement.subcutaneousFat,
-            physicalAge = measurement.physicalAge,
-            leanMass = measurement.leanMass,
-            standardWeight = measurement.standardWeight,
-            skeletalMuscle = measurement.skeletalMuscle,
-            muscleRatio = measurement.muscleRatio,
-            bodyType = measurement.bodyType
-        )
-
-        AlertDialog.Builder(this)
-            .setTitle("Detalle - ${SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()).format(measurement.timestamp)}")
-            .setMessage(BodyCompositionCalculator.formatStats(stats))
-            .setPositiveButton("OK", null)
-            .show()
-    }
-
+    // --- Exportación de datos ---
     private fun showExportDialog() {
-        val options = arrayOf("Exportar CSV", "Exportar JSON")   // FIX: removed fake XLS option
-
+        val options = arrayOf("Exportar CSV", "Exportar JSON")
         AlertDialog.Builder(this)
             .setTitle("Exportar datos")
             .setItems(options) { _, which ->
@@ -383,13 +333,12 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // FIX: exports now use a share intent so the user can open/send the file directly
     private fun exportAndShare(format: String) {
         lifecycleScope.launch {
             val measurements = db.measurementDao().getAll()
             val (content, mimeType) = when (format) {
                 "json" -> Gson().toJson(measurements) to "application/json"
-                else   -> buildCSV(measurements) to "text/csv"
+                else -> buildCSV(measurements) to "text/csv"
             }
 
             val filename = "balanza_${System.currentTimeMillis()}.$format"
@@ -431,12 +380,30 @@ class MainActivity : AppCompatActivity() {
         return file
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(bleReceiver)
-        // Note: do NOT call disconnect() here if autoconnect is on — the service keeps running
-        if (!SettingsActivity.isAutoConnectEnabled(this)) {
-            bluetoothLeService?.disconnect()
-        }
+    // --- Detalles de medición ---
+    private fun showMeasurementDetail(measurement: Measurement) {
+        val stats = BodyCompositionCalculator.Result(
+            bmi = measurement.bmi,
+            bodyWater = measurement.bodyWater,
+            bodyFat = measurement.bodyFat,
+            muscleMass = measurement.muscleMass,
+            visceralFat = measurement.visceralFat,
+            boneMass = measurement.boneMass,
+            bmr = measurement.bmr,
+            protein = measurement.protein,
+            subcutaneousFat = measurement.subcutaneousFat,
+            physicalAge = measurement.physicalAge,
+            leanMass = measurement.leanMass,
+            standardWeight = measurement.standardWeight,
+            skeletalMuscle = measurement.skeletalMuscle,
+            muscleRatio = measurement.muscleRatio,
+            bodyType = measurement.bodyType
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle("Detalle - ${SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()).format(measurement.timestamp)}")
+            .setMessage(BodyCompositionCalculator.formatStats(stats))
+            .setPositiveButton("OK", null)
+            .show()
     }
 }
